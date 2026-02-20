@@ -1,3 +1,56 @@
+diff --git a/node_modules/@connorbritain/mssql-mcp-core/dist/server/toolsets.js b/node_modules/@connorbritain/mssql-mcp-core/dist/server/toolsets.js
+index 30b0f85..39542b3 100755
+--- a/node_modules/@connorbritain/mssql-mcp-core/dist/server/toolsets.js
++++ b/node_modules/@connorbritain/mssql-mcp-core/dist/server/toolsets.js
+@@ -6,6 +6,7 @@ import { DeleteDataTool } from "../tools/DeleteDataTool.js";
+ import { DescribeTableTool } from "../tools/DescribeTableTool.js";
+ import { DropTableTool } from "../tools/DropTableTool.js";
+ import { ExecuteTransactionTool } from "../tools/ExecuteTransactionTool.js";
++import { ExecuteDdlTool } from "../tools/ExecuteDdlTool.js";
+ import { ExplainQueryTool } from "../tools/ExplainQueryTool.js";
+ import { InsertDataTool } from "../tools/InsertDataTool.js";
+ import { InspectDependenciesTool } from "../tools/InspectDependenciesTool.js";
+@@ -32,6 +33,7 @@ export function createAllToolInstances() {
+         deleteDataTool: new DeleteDataTool(),
+         describeTableTool: new DescribeTableTool(),
+         dropTableTool: new DropTableTool(),
++        executeDdlTool: new ExecuteDdlTool(),
+         executeTransactionTool: new ExecuteTransactionTool(),
+         explainQueryTool: new ExplainQueryTool(),
+         insertDataTool: new InsertDataTool(),
+@@ -87,6 +89,7 @@ export function getAdminTools(t) {
+         t.createTableTool,
+         t.createIndexTool,
+         t.dropTableTool,
++        t.executeDdlTool,
+     ];
+ }
+ // ─── Transaction tool lists ────────────────────────────────────────────────
+@@ -123,6 +126,7 @@ export const ADMIN_MUTATING_TOOLS = new Set([
+     "create_table",
+     "create_index",
+     "drop_table",
++    "execute_ddl",
+     "begin_transaction",
+     "commit_transaction",
+     "rollback_transaction",
+@@ -327,6 +331,15 @@ export function buildToolRegistry(t) {
+             requiredArgs: ["objectName"],
+             baseScore: 1.5,
+         },
++        {
++            tool: t.executeDdlTool,
++            name: t.executeDdlTool.name,
++            intents: ["schema_change"],
++            keywords: ["create view", "alter table", "create function", "ddl"],
++            requiredArgs: ["tableName", "sql"],
++            schemaChange: true,
++            mutatesData: true,
++        },
+     ];
+ }
+ //# sourceMappingURL=toolsets.js.map
+\ No newline at end of file
 diff --git a/node_modules/@connorbritain/mssql-mcp-core/dist/server/wrapToolRun.js b/node_modules/@connorbritain/mssql-mcp-core/dist/server/wrapToolRun.js
 index 7ff13bd..959add1 100755
 --- a/node_modules/@connorbritain/mssql-mcp-core/dist/server/wrapToolRun.js
@@ -22,3 +75,95 @@ index 7ff13bd..959add1 100755
          // Check requireApproval policy (skip for approval-exempt tools)
          if (policy.requireApproval && !approvalExemptTools.has(tool.name)) {
              const hasConfirmation = rawArgs.confirm === true;
+diff --git a/node_modules/@connorbritain/mssql-mcp-core/dist/tools/ExecuteDdlTool.js b/node_modules/@connorbritain/mssql-mcp-core/dist/tools/ExecuteDdlTool.js
+new file mode 100644
+index 0000000..cdf5aac
+--- /dev/null
++++ b/node_modules/@connorbritain/mssql-mcp-core/dist/tools/ExecuteDdlTool.js
+@@ -0,0 +1,74 @@
++import sql from "mssql";
++export class ExecuteDdlTool {
++    constructor() {
++        this.name = "execute_ddl";
++        this.description = "Executes a DDL statement (CREATE VIEW, ALTER TABLE, etc.) against a specific schema. Only allowed on schemas permitted by the environment's allowedSchemas policy. The tableName parameter must be set to 'schema.objectName' so that schema enforcement can verify access.";
++        this.inputSchema = {
++            type: "object",
++            properties: {
++                tableName: {
++                    type: "string",
++                    description: "Schema-qualified object name for schema enforcement (e.g., 'staging.MyView'). Must match the schema used in the SQL statement."
++                },
++                sql: {
++                    type: "string",
++                    description: "The DDL SQL statement to execute (e.g., CREATE VIEW, ALTER TABLE, CREATE FUNCTION). Must not contain INSERT/UPDATE/DELETE/DROP/TRUNCATE."
++                },
++                environment: {
++                    type: "string",
++                    description: "Optional environment name to target.",
++                },
++            },
++            required: ["tableName", "sql"],
++        };
++    }
++    async run(params) {
++        try {
++            const { tableName, sql: ddlSql } = params;
++            // Validate tableName has a schema prefix
++            if (!tableName || !tableName.includes('.')) {
++                return {
++                    success: false,
++                    message: "tableName must be schema-qualified (e.g., 'staging.MyView') for schema enforcement.",
++                    error: "INVALID_TABLE_NAME",
++                };
++            }
++            const normalised = ddlSql.trim().toUpperCase();
++            // Block destructive DML — only allow DDL
++            const blocked = ["INSERT ", "UPDATE ", "DELETE ", "DROP ", "TRUNCATE ", "EXEC ", "EXECUTE "];
++            for (const keyword of blocked) {
++                if (normalised.startsWith(keyword)) {
++                    return {
++                        success: false,
++                        message: `execute_ddl does not allow ${keyword.trim()} statements. Use the dedicated tools for data operations.`,
++                        error: "DDL_ONLY",
++                    };
++                }
++            }
++            // Only allow CREATE / ALTER statements
++            const allowed = ["CREATE ", "ALTER "];
++            const isAllowed = allowed.some((kw) => normalised.startsWith(kw));
++            if (!isAllowed) {
++                return {
++                    success: false,
++                    message: `execute_ddl only allows CREATE and ALTER statements. Got: ${normalised.substring(0, 30)}...`,
++                    error: "DDL_ONLY",
++                };
++            }
++            const request = new sql.Request(params.pool);
++            await request.query(ddlSql);
++            return {
++                success: true,
++                message: `DDL executed successfully for '${tableName}'.`,
++            };
++        }
++        catch (error) {
++            console.error("Error executing DDL:", error);
++            return {
++                success: false,
++                message: `Failed to execute DDL: ${error}`,
++            };
++        }
++    }
++}
++//# sourceMappingURL=ExecuteDdlTool.js.map
+diff --git a/node_modules/@connorbritain/mssql-mcp-core/dist/tools/index.js b/node_modules/@connorbritain/mssql-mcp-core/dist/tools/index.js
+index 08ea3bc..cb4d73b 100755
+--- a/node_modules/@connorbritain/mssql-mcp-core/dist/tools/index.js
++++ b/node_modules/@connorbritain/mssql-mcp-core/dist/tools/index.js
+@@ -7,6 +7,7 @@ export { DeleteDataTool } from "./DeleteDataTool.js";
+ export { DescribeTableTool } from "./DescribeTableTool.js";
+ export { DropTableTool } from "./DropTableTool.js";
+ export { ExecuteTransactionTool } from "./ExecuteTransactionTool.js";
++export { ExecuteDdlTool } from "./ExecuteDdlTool.js";
+ export { ExplainQueryTool } from "./ExplainQueryTool.js";
+ export { InsertDataTool } from "./InsertDataTool.js";
+ export { InspectDependenciesTool } from "./InspectDependenciesTool.js";
